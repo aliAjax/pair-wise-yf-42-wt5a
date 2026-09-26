@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, founder_ledger as build_founder_ledger
 
 
 class DomainService:
@@ -26,7 +26,7 @@ class DomainService:
                 entity = self.repository.get_entity(existing)
                 if entity:
                     return entity
-        self.rules.validate_create(actor, kind, payload, self._lookup)
+        payload = self.rules.validate_create(actor, kind, payload, self._lookup)
         entity_id = str(payload.pop("id", "") or uuid4())
         if self.repository.get_entity(entity_id):
             raise ConflictError("entity already exists: " + entity_id)
@@ -68,6 +68,10 @@ class DomainService:
         if kind:
             kind = self.rules.normalize_kind(kind)
         return self.repository.list_entities(kind=kind, status=status)
+
+    def founder_ledger(self):
+        animals = self.repository.list_entities(kind="animal")
+        return build_founder_ledger(animals)
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

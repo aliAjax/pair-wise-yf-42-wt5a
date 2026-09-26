@@ -34,6 +34,9 @@ python3 app.py --db ./data.db --port 8308
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
+- `GET /api/founder-ledger`：血缘贡献台账。沿父母链回算每只奠基个体（档案未记录父本的个体）在存活个体（非 deceased）中的血缘占比，按占比降序列出奠基个体及全部携带个体；隔离或已去世个体照常列出，但不能进入新配对建议。
+
+新建配对建议（`POST /api/pairing`）必须携带`sire_id`和`dam_id`，系统会计算双亲的奠基血缘重合度（共有奠基血缘占比之和）并写入`founder_overlap`；超过上限`FOUNDER_OVERLAP_LIMIT`（0.25）时拒绝进入待审，错误信息会指出重合最多的奠基个体。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 

@@ -27,6 +27,149 @@ def inbreeding_coefficient(sire, dam):
     return 0.0
 
 
+FOUNDER_OVERLAP_LIMIT = 0.25
+
+
+def founder_contribution_map(entity, lookup, memo=None, visiting=None):
+    """Return {founder_id: fraction} of founder blood carried by one animal.
+
+    Animals without a recorded sire are founders. Each recorded parent
+    contributes half; a missing parent contributes nothing. Cycles in bad
+    pedigree data are broken by returning an empty map.
+    """
+    if memo is None:
+        memo = {}
+    if visiting is None:
+        visiting = set()
+    animal_id = entity.get("id")
+    if animal_id in memo:
+        return memo[animal_id]
+    data = entity.get("data", {})
+    sire_id = data.get("sire_id")
+    if not sire_id:
+        result = {animal_id: 1.0}
+    elif animal_id in visiting:
+        result = {}
+    else:
+        visiting.add(animal_id)
+        result = {}
+        for parent_id in (sire_id, data.get("dam_id")):
+            if not parent_id:
+                continue
+            parent = _find_one(lookup, "animal", "id", parent_id)
+            if not parent:
+                continue
+            for founder_id, frac in founder_contribution_map(
+                parent, lookup, memo, visiting
+            ).items():
+                result[founder_id] = result.get(founder_id, 0.0) + 0.5 * frac
+        visiting.discard(animal_id)
+    memo[animal_id] = result
+    return result
+
+
+def founder_overlap(sire, dam, lookup, memo=None):
+    """Return (shared founder blood fraction, (top founder_id, amount))."""
+    if memo is None:
+        memo = {}
+    sire_map = founder_contribution_map(sire, lookup, memo)
+    dam_map = founder_contribution_map(dam, lookup, memo)
+    shared = {}
+    for founder_id, sire_frac in sire_map.items():
+        dam_frac = dam_map.get(founder_id)
+        if dam_frac:
+            shared[founder_id] = min(sire_frac, dam_frac)
+    top = max(shared.items(), key=lambda item: item[1]) if shared else None
+    return sum(shared.values()), top
+
+
+def founder_ledger(animals):
+    """Founder blood shares among living animals, plus all carriers.
+
+    Living means not deceased: quarantined animals still count in the pool.
+    Deceased and quarantined animals remain listed as founders/carriers.
+    """
+    by_id = {animal["id"]: animal for animal in animals}
+
+    def lookup(kind, field, value):
+        if kind == "animal" and field == "id":
+            entity = by_id.get(value)
+            return [entity] if entity else []
+        return []
+
+    memo = {}
+    contribs = {
+        animal["id"]: founder_contribution_map(animal, lookup, memo)
+        for animal in animals
+    }
+    living = [animal for animal in animals if animal["status"] != "deceased"]
+    entries = []
+    for founder in animals:
+        if founder["data"].get("sire_id"):
+            continue
+        founder_id = founder["id"]
+        carriers = [
+            {
+                "animal_id": animal["id"],
+                "name": animal["data"].get("name"),
+                "status": animal["status"],
+                "contribution": round(contribs[animal["id"]].get(founder_id, 0.0), 6),
+            }
+            for animal in animals
+            if contribs[animal["id"]].get(founder_id, 0.0) > 0
+        ]
+        carriers.sort(key=lambda item: (-item["contribution"], item["animal_id"]))
+        share = (
+            sum(contribs[animal["id"]].get(founder_id, 0.0) for animal in living)
+            / len(living)
+            if living
+            else 0.0
+        )
+        entries.append({
+            "founder_id": founder_id,
+            "name": founder["data"].get("name"),
+            "status": founder["status"],
+            "share": round(share, 6),
+            "carriers": carriers,
+        })
+    entries.sort(key=lambda item: (-item["share"], item["founder_id"]))
+    return {
+        "founders": entries,
+        "animal_total": len(animals),
+        "living_total": len(living),
+    }
+
+
+def _ensure_founder_overlap(sire, dam, lookup):
+    total, top = founder_overlap(sire, dam, lookup)
+    if total > FOUNDER_OVERLAP_LIMIT:
+        founder = _find_one(lookup, "animal", "id", top[0])
+        name = founder["data"].get("name") if founder else None
+        label = "%s (%s)" % (name, top[0]) if name else top[0]
+        raise ValidationError(
+            "founder overlap %.4f exceeds limit %.2f; top shared founder: %s"
+            % (total, FOUNDER_OVERLAP_LIMIT, label)
+        )
+    return total, top
+
+
+def _validate_pairing_register(actor, data, lookup):
+    sire = _find_one(lookup, "animal", "id", data.get("sire_id"))
+    dam = _find_one(lookup, "animal", "id", data.get("dam_id"))
+    if not sire or not dam:
+        raise ValidationError("pairing requires two existing animals")
+    if sire["status"] != "active" or dam["status"] != "active":
+        raise ValidationError("pairing animals must be active")
+    total, top = _ensure_founder_overlap(sire, dam, lookup)
+    extra = {
+        "founder_overlap": round(total, 6),
+        "founder_overlap_limit": FOUNDER_OVERLAP_LIMIT,
+    }
+    if top:
+        extra["top_shared_founder"] = top[0]
+    return extra
+
+
 def _validate_pairing(actor, entity, data, lookup):
     sire = _find_one(lookup, "animal", "id", data.get("sire_id"))
     dam = _find_one(lookup, "animal", "id", data.get("dam_id"))
@@ -36,10 +179,11 @@ def _validate_pairing(actor, entity, data, lookup):
         raise ValidationError("pairing animals must be active")
     if inbreeding_coefficient(sire["data"], dam["data"]) > 0.125:
         raise ValidationError("pairing exceeds inbreeding threshold")
+    _ensure_founder_overlap(sire, dam, lookup)
     return {"approved_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'animal': _validate_animal}
+CUSTOM_CREATE = {'animal': _validate_animal, 'pairing': _validate_pairing_register}
 CUSTOM_TRANSITIONS = {('pairing', 'approve'): _validate_pairing}
 
 
@@ -47,7 +191,7 @@ class RuleEngine:
     ALIASES = {'animals': 'animal', 'pairings': 'pairing', 'transfers': 'transfer'}
     INITIAL_STATUS = {'animal': 'active', 'pairing': 'proposed', 'transfer': 'planned'}
     TRANSITIONS = {'animal': {'mark_deceased': (('active',), 'deceased'), 'quarantine_animal': (('active',), 'quarantined'), 'release_quarantine': (('quarantined',), 'active')}, 'pairing': {'approve': (('proposed',), 'approved'), 'reject': (('proposed',), 'rejected'), 'complete': (('approved',), 'completed')}, 'transfer': {'authorize': (('planned',), 'authorized'), 'ship': (('authorized',), 'in_transit'), 'arrive': (('in_transit',), 'completed')}}
-    CREATE_REQUIRED = {'animal': ('name', 'sex'), 'pairing': ('proposed_by',), 'transfer': ('animal_id', 'from_institution', 'to_institution')}
+    CREATE_REQUIRED = {'animal': ('name', 'sex'), 'pairing': ('proposed_by', 'sire_id', 'dam_id'), 'transfer': ('animal_id', 'from_institution', 'to_institution')}
     ACTION_REQUIRED = {('animal', 'mark_deceased'): ('cause',), ('animal', 'quarantine_animal'): ('reason',), ('pairing', 'approve'): ('sire_id', 'dam_id', 'approvals'), ('pairing', 'reject'): ('reason',), ('pairing', 'complete'): ('offspring_ids',), ('transfer', 'authorize'): ('permit_id',), ('transfer', 'ship'): ('transport_id',), ('transfer', 'arrive'): ('arrival_date',)}
     CREATE_ROLES = {'animal': ('admin', 'registrar'), 'pairing': ('admin', 'coordinator'), 'transfer': ('admin', 'registrar')}
     ROLE_ACTIONS = {'mark_deceased': ('admin', 'veterinarian'), 'quarantine_animal': ('admin', 'veterinarian'), 'release_quarantine': ('admin', 'veterinarian'), 'approve': ('admin', 'coordinator'), 'reject': ('admin', 'coordinator'), 'complete': ('admin', 'coordinator'), 'authorize': ('admin', 'registrar'), 'ship': ('admin', 'registrar'), 'arrive': ('admin', 'registrar')}
@@ -80,9 +224,11 @@ class RuleEngine:
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = CUSTOM_CREATE.get(kind)
-        if custom:
-            custom(actor, data, lookup)
-        return dict(data)
+        extra = custom(actor, data, lookup) if custom else None
+        merged = dict(data)
+        if extra:
+            merged.update(extra)
+        return merged
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
