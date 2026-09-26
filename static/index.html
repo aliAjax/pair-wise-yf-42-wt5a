@@ -5,30 +5,183 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>动物园谱系与繁育协调</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; background: #fafafa; }
+    main { max-width: 960px; margin: auto; }
+    section { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 1.2rem 1.4rem; margin-bottom: 1.5rem; }
+    h1 { margin-bottom: .25rem; }
+    h2 { margin-top: 0; font-size: 1.15rem; }
+    table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+    th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+    th { color: #6b7280; font-weight: 600; }
+    .bar-cell { white-space: nowrap; }
+    .bar { display: inline-block; height: 10px; background: #2563eb; border-radius: 5px; vertical-align: middle; margin-right: .4rem; }
+    .pct { font-variant-numeric: tabular-nums; }
+    .tag { display: inline-block; font-size: .72rem; padding: .05rem .4rem; border-radius: 999px; margin-left: .3rem; }
+    .tag-active { background: #dcfce7; color: #166534; }
+    .tag-quarantined { background: #fef9c3; color: #854d0e; }
+    .tag-deceased { background: #fee2e2; color: #991b1b; }
+    .carrier { display: inline-block; font-size: .78rem; background: #f3f4f6; border-radius: 6px; padding: .1rem .45rem; margin: .1rem .2rem .1rem 0; white-space: nowrap; }
+    select, input, button { padding: .45rem .6rem; font-size: .92rem; }
+    button { cursor: pointer; border: none; background: #2563eb; color: #fff; border-radius: 6px; }
+    button.secondary { background: #6b7280; }
+    .row { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; margin-bottom: .6rem; }
+    .ok { color: #166534; }
+    .err { color: #991b1b; background: #fee2e2; border-radius: 6px; padding: .5rem .7rem; }
+    .hint { color: #6b7280; font-size: .85rem; }
     pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
   </style>
 </head>
 <body>
 <main>
   <h1>动物园谱系与繁育协调</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+  <p class="hint">奠基血缘贡献台账：沿父母链回算，父本缺失的个体按奠基个体处理。占比 = 奠基血缘在存活个体中的平均值；隔离或去世个体的占比照常显示，但不能再进入新配对建议。</p>
+
+  <section>
+    <h2>奠基血缘贡献台账 <button class="secondary" onclick="loadLedger()" style="float:right">刷新</button></h2>
+    <p class="hint" id="ledger-summary">加载中…</p>
+    <table>
+      <thead><tr><th>奠基个体</th><th style="width:30%">在存活个体中的占比</th><th>携带个体（贡献占比）</th></tr></thead>
+      <tbody id="ledger-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>新建配对建议</h2>
+    <div class="row">
+      <label>父本 <select id="sire"></select></label>
+      <label>母本 <select id="dam"></select></label>
+      <button onclick="previewPairing()">试算血缘重合度</button>
+      <button onclick="submitPairing()">提交待审</button>
+    </div>
+    <p class="hint">重合度 = 双亲在各奠基个体占比取较小值之和；超过 <strong>0.25</strong> 的配对无法进入待审，并会指出重合最多的奠基个体。仅在养（active）个体可入选。</p>
+    <div id="pairing-result"></div>
+  </section>
+
+  <section>
+    <h2>配对建议记录 <button class="secondary" onclick="loadPairings()" style="float:right">刷新</button></h2>
+    <table>
+      <thead><tr><th>ID</th><th>状态</th><th>父本</th><th>母本</th><th>血缘重合度</th><th>重合最多奠基者</th></tr></thead>
+      <tbody id="pairings-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>服务状态</h2>
+    <p><button class="secondary" onclick="checkHealth()">检查服务状态</button></p>
+    <pre id="result">等待操作</pre>
+  </section>
 </main>
 <script>
+const STATUS_LABEL = {active: '在养', quarantined: '隔离', deceased: '已故', proposed: '待审', approved: '已批准', rejected: '已驳回', completed: '已完成'};
+const HEADERS = {'Content-Type': 'application/json', 'X-User-Id': 'coordinator-web', 'X-Role': 'coordinator'};
+
+function pct(value) { return (value * 100).toFixed(2) + '%'; }
+function esc(value) { return String(value ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function tag(status) {
+  const cls = ({active: 'tag-active', quarantined: 'tag-quarantined'})[status] || 'tag-deceased';
+  return `<span class="tag ${cls}">${esc(STATUS_LABEL[status] || status)}</span>`;
+}
+function bar(value) {
+  const width = Math.max(2, Math.round(value * 160));
+  return `<span class="bar" style="width:${width}px"></span><span class="pct">${pct(value)}</span>`;
+}
+
+let animals = [];
+async function loadAnimals() {
+  const res = await fetch('/api/animal');
+  animals = (await res.json()).items || [];
+  for (const selectId of ['sire', 'dam']) {
+    const select = document.getElementById(selectId);
+    const current = select.value;
+    select.innerHTML = animals.map(a => {
+      const disabled = a.status !== 'active' ? ' disabled' : '';
+      const suffix = a.status !== 'active' ? `（${STATUS_LABEL[a.status] || a.status}，不可入选）` : '';
+      return `<option value="${esc(a.id)}"${disabled}>${esc(a.data.name || a.id)}${suffix}</option>`;
+    }).join('');
+    if (current) select.value = current;
+  }
+}
+
+async function loadLedger() {
+  const [ledgerRes] = await Promise.all([fetch('/api/pedigree/founders'), loadAnimals()]);
+  const ledger = await ledgerRes.json();
+  document.getElementById('ledger-summary').textContent =
+    `存活个体 ${ledger.living_count} 只；台账按占比降序排列。`;
+  document.getElementById('ledger-body').innerHTML = (ledger.founders || []).map(f => `
+    <tr>
+      <td><strong>${esc(f.founder_name)}</strong>
+        <div class="hint">${esc(f.founder_id)}</div>${tag(f.founder_status)}</td>
+      <td class="bar-cell">${bar(f.share)}</td>
+      <td>${f.carriers.map(c =>
+        `<span class="carrier">${esc(c.animal_name)} ${pct(c.contribution)}${c.status !== 'active' ? ' ' + tag(c.status) : ''}</span>`
+      ).join('') || '<span class="hint">无存活携带个体</span>'}</td>
+    </tr>`).join('');
+  await loadPairings();
+}
+
+async function previewPairing() {
+  const sireId = document.getElementById('sire').value;
+  const damId = document.getElementById('dam').value;
+  const box = document.getElementById('pairing-result');
+  try {
+    const res = await fetch(`/api/pedigree/overlap?sire_id=${encodeURIComponent(sireId)}&dam_id=${encodeURIComponent(damId)}`);
+    const payload = await res.json();
+    if (!res.ok) { box.innerHTML = `<p class="err">${esc(payload.error)}</p>`; return; }
+    const detail = (payload.founder_overlap_detail || []).map(d =>
+      `<span class="carrier">${esc(d.founder_id)} 重合 ${pct(d.overlap)}（父 ${pct(d.sire_contribution)} / 母 ${pct(d.dam_contribution)}）</span>`
+    ).join('') || '<span class="hint">无共同奠基血缘</span>';
+    const verdict = payload.within_limit
+      ? (payload.both_active ? `<p class="ok">血缘重合度 ${pct(payload.founder_overlap)}，未超上限 ${pct(payload.limit)}，可提交待审。</p>`
+                             : `<p class="err">血缘重合度 ${pct(payload.founder_overlap)} 未超上限，但父本或母本当前为隔离/已故状态，不能进入新建议。</p>`)
+      : `<p class="err">血缘重合度 ${pct(payload.founder_overlap)} 超过上限 ${pct(payload.limit)}，无法进入待审。重合最多的奠基个体：${esc(payload.top_shared_founder_id)}（重合 ${pct(payload.top_shared_overlap)}）。</p>`;
+    box.innerHTML = verdict + `<p>${detail}</p>`;
+  } catch (err) {
+    box.innerHTML = `<p class="err">请求失败：${esc(err.message)}</p>`;
+  }
+}
+
+async function submitPairing() {
+  const sireId = document.getElementById('sire').value;
+  const damId = document.getElementById('dam').value;
+  const box = document.getElementById('pairing-result');
+  try {
+    const res = await fetch('/api/pairing', {
+      method: 'POST', headers: HEADERS,
+      body: JSON.stringify({proposed_by: 'coordinator-web', sire_id: sireId, dam_id: damId})
+    });
+    const payload = await res.json();
+    if (res.ok) {
+      box.innerHTML = `<p class="ok">血缘重合度 ${pct(payload.data.founder_overlap)}，已进入待审（建议ID：${esc(payload.id)}）。</p>`;
+      await loadPairings();
+    } else {
+      box.innerHTML = `<p class="err">${esc(payload.error)}</p>`;
+    }
+  } catch (err) {
+    box.innerHTML = `<p class="err">请求失败：${esc(err.message)}</p>`;
+  }
+}
+
+async function loadPairings() {
+  const nameOf = id => { const a = animals.find(x => x.id === id); return a ? (a.data.name || a.id) : id; };
+  const res = await fetch('/api/pairing');
+  const items = (await res.json()).items || [];
+  document.getElementById('pairings-body').innerHTML = items.map(p => `
+    <tr>
+      <td>${esc(p.id)}</td>
+      <td>${esc(STATUS_LABEL[p.status] || p.status)}</td>
+      <td>${esc(nameOf(p.data.sire_id))}</td>
+      <td>${esc(nameOf(p.data.dam_id))}</td>
+      <td class="pct">${pct(p.data.founder_overlap || 0)}</td>
+      <td>${esc(p.data.top_shared_founder_id ? nameOf(p.data.top_shared_founder_id) + ' @ ' + pct(p.data.top_shared_overlap || 0) : '无共同奠基者')}</td>
+    </tr>`).join('') || '<tr><td colspan="6" class="hint">暂无配对建议</td></tr>';
+}
+
 async function checkHealth() {
   const response = await fetch('/health');
   document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
 }
+
+loadLedger();
 </script>
 </body>
 </html>

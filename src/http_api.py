@@ -85,6 +85,17 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "pedigree", "founders"]:
+                    return self._send(200, service.founder_ledger())
+                if parts == ["api", "pedigree", "overlap"]:
+                    query = parse_qs(parsed.query)
+                    sire_id = query.get("sire_id", [None])[0]
+                    dam_id = query.get("dam_id", [None])[0]
+                    if not sire_id or not dam_id:
+                        raise ValidationError("sire_id and dam_id are required")
+                    return self._send(
+                        200, service.pairing_overlap(sire_id, dam_id)
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
